@@ -5,31 +5,55 @@ import webbrowser
 from threading import Timer
 from speech_recognition import Recognizer, AudioFile
 from werkzeug.utils import secure_filename
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from deepmultilingualpunctuation import PunctuationModel
 
 app = Flask(__name__)
+yuklenen_dosyalar = "uploads"
+app.config["yuklenen_dosyalar"] = yuklenen_dosyalar
+dosya_turleri = {"mp3", "m4a"}
 
-UPLOAD_FOLDER = "uploads"
-app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
-ALLOWED_EXTENSIONS = {"mp3", "m4a"}
+tokenizer = AutoTokenizer.from_pretrained("csebuetnlp/mT5_multilingual_XLSum")
+model = AutoModelForSeq2SeqLM.from_pretrained("csebuetnlp/mT5_multilingual_XLSum")
 
-if not os.path.exists(UPLOAD_FOLDER):
-    os.makedirs(UPLOAD_FOLDER)
+punct_model = PunctuationModel(model="oliverguhr/fullstop-punctuation-multilingual-sonar-base")
 
-def allowed_file(filename):
-    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+def metin_duzenleme(text):
+    text = text.strip()
+    try:
+        punctuated = punct_model.restore_punctuation(text)
+        return punctuated
+    except Exception as e:
+        print("Noktalama hatası:", e)
+        return text
+
+def metin_ozetleme(text):
+    girilen_metin = "tr: " + text
+    girilenler = tokenizer([girilen_metin], return_tensors="pt", max_length=10000, truncation=True)
+    summary_ids = model.generate(
+        girilenler["input_ids"],
+        max_length=1000,
+        min_length=1,
+        length_penalty=1.0,
+        num_beams=4,
+        early_stopping=True
+    )
+    return tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+
+def uygun_turler(filename):
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in dosya_turleri
 
 def convert_mp3_to_wav(mp3_path):
     wav_path = mp3_path.rsplit('.', 1)[0] + '.wav'
     subprocess.run(['ffmpeg', '-i', mp3_path, wav_path, '-y'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return wav_path
 
-def transcribe_audio(wav_path):
+def ses_donusturucu(wav_path):
     recognizer = Recognizer()
     with AudioFile(wav_path) as source:
-        audio = recognizer.record(source)
+        ses = recognizer.record(source)
     try:
-        text = recognizer.recognize_google(audio, language="tr-TR")
-        return text
+        return recognizer.recognize_google(ses, language="tr-TR")
     except Exception as e:
         return f"Ses tanıma hatası: {e}"
 
@@ -41,15 +65,18 @@ def index():
         file = request.files["file"]
         if file.filename == "":
             return "Dosya seçilmedi."
-        if file and allowed_file(file.filename):
+        if file and uygun_turler(file.filename):
             filename = secure_filename(file.filename)
-            file_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+            file_path = os.path.join(app.config["yuklenen_dosyalar"], filename)
             file.save(file_path)
 
             wav_path = convert_mp3_to_wav(file_path)
-            metin = transcribe_audio(wav_path)
+            raw_text = ses_donusturucu(wav_path)
 
-            return render_template("index.html", metin=metin)
+            metin = metin_duzenleme(raw_text)
+            ozet = metin_ozetleme(metin)
+
+            return render_template("index.html", metin=metin, ozet=ozet)
     return render_template("index.html")
 
 if __name__ == "__main__":
